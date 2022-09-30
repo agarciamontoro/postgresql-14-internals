@@ -1,0 +1,557 @@
+:PROPERTIES:
+:ID:       6dc6dbab-083c-41ef-bf78-74a6e5ec50e4
+:END:
+#+title: PostgreSQL 14 Internals
+#+filetags: book
+* Metadata
+
+- Author: [[id:a4d3b9c4-8146-42c4-af83-3ac12fd164cd][Egor Rogov]]
+- Began reading: <2022-07-27 mié>
+- Ended reading:
+- Rating: /3
+
+* Notes
+
+** Chapter 1: Introduction
+
+*** Data Organization
+
+The logical distribution of objects are determined by:
+- Databases
+- Schemas
+
+The physical layout is determined by:
+- Tablespaces
+
+**** Databases
+All data from a database cluster (a collection of databases served by a single PostgreSQL server) is contained in a directory usually called =PGDATA=. Initially, it contains three databases:
+- =template0=, never modified, used for restoring data or creating a db with a different encoding
+- =template1=, used as a template for all other databases that can be created
+- =postgres=, a regular database already
+
+**** System Catalog
+The system catalog contains the metadata of all cluster objects (tables, indexes, data types, functions...).
+- All system catalog tables are prefixed by =pg_=.
+- All columns are prefixed by three letters that usually correspond to the table name.
+- All tables have a primary key column: =oid= (from object identifier), a 32-bit integer (type also called =oid=)
+
+**** Schemas
+Schemas are namespaces for the objects of a database.
+
+**** Tablespaces
+Tablespaces define the physical data layout of objects. A tablespace is virtually (what does virtually mean?) a directory in a file system. A tablespace can contain objects from different databases, and a database can store its objects in several tablespaces.
+
+Interesting property:
+#+begin_quote
+You can distribute your data between tablespaces in such a way that archive data is stored on slow disks, while the data that is being actively updated goes to fast disks.
+#+end_quote
+
+By default, each database has its own /default tablespace/, which contains:
+- All objects from the database
+- All objects related to this database from the system catalog
+
+There are also always two tablespaces:
+- pg_default, the default tablespace (but doesn't each database have one for it?)
+- pg_global, that contain system catalog objects common to the whole cluster
+
+In the [[Files and Forks]] section, it's said:
+#+begin_quote
+Each tablespace directory (except for pg_global) contains separate subdirectories
+for particular databases. All files of the objects belonging to the same tablespace
+and database are located in the same subdirectory.
+#+end_quote
+
+**** Relations
+All objects that consist of rows (tables, indexes, sequences, materialized views) are called relations.
+
+**** Files and Forks
+All information from a relation is stored in a collection of forks.
+A fork is a collection of 1GB (historical limit that can be configured) files called segments. Each filename is of the form =<oid>_<type>.<seq>=, where:
+- =<oid>= is a numeric identifier of the fork
+- =<type>= is the type of the fork
+- =<seq>= is the number of segment (if there is more than one file in the fork)
+
+The types of forks are:
+- The main fork: it contains the actual table rows or index rows.
+- The initialization fork: available only for unlogged tables and their indexes. Actions performed on these objects are not written into the write-ahead log (WAL).
+- The free space map: organized as a tree, it keeps track of available space within pages. This fork's files only appear when needed. It takes at least three pages.
+- The visibility map fork: available only for tables (not for indexes), it contains two bits for each table page:
+  - The first is set for pages that contain only up-to-date row versions
+  - The second bit is set for pages that contain only frozen row versions.
+
+**** Pages
+The minimum amount of data that can be read or written is called a page. The default is usually =8kb= (configured up to =32kb= only during build time). The I/O is similar for all files:
+1. Pages are moved to the buffer cache (where they can be read and updated by processes)
+2. Pages are flushed back to disk as required.
+
+**** TOAST
+#+begin_quote
+Each row must fit a single page: there is no way to continue a row on the next page.
+#+end_quote
+Is this a design decision? Is there any other solution that could have worked here?
+
+When a long attribute is used in a table, it is not physically stored in the table itself, but on an ancillary table called TOAST (from The Oversized Attributes Storage Technique). This is done because every row must fit in a single page, which usually has 8192 KB (ideally, each page should accommodate four rows): if one does not (e.g., a JSON or TEXT column has a lot of data that even compressed does not fit in one page), then the data is either:
+- sliced into smaller "toasts"
+- compressed
+- both sliced and compressed
+and then stored in a TOAST table.
+
+- A TOAST table is created always for tables that contain potentially long attributes (=numeric= or =text= types, for example).
+- For indexes, the TOAST mechanism can offer only compression.
+
+There are four available strategies:
+- =plain=: TOAST is not used
+- =extended=: compression in a separate TOAST table
+- =external=: only separate TOAST table
+- =main=: first compression; if it does not help, move to separate TOAST table
+
+See SQL queries from page 27 to see an example.
+
+The algorithm tries to reduce the size of each row to 1/4 of a page excluding the page's header, so around 2000 bytes: this threshold can be redefined at the table level.
+
+#+begin_quote
+It may sometimes be useful to change the default strategy for some of the columns. If it is known in advance that the data in a particular column cannot be compressed (for example, the column stores JPEG images), you can set the =external= strategy for this column.
+#+end_quote
+
+
+The interesting thing here is that the TOAST table is read only if needed; i.e., if that specific attribute has to be read. Quoting the author:
+
+#+begin_quote
+It is one of the reasons why you should avoid using the asterisk in production solutions.
+#+end_quote
+
+*** Processes and Memory
+
+Postgres has always used a process-based architecture because of its simplicity, but it has some disadvantages that could be solved by switching to a thread-based structure (parallel algoithms difficult to optimize, sessions bound to processes?). The whole refactor that that would imply and other challenges have stopped this change for many years.
+
+Several processes are run to maintain server operation:
+- startup
+- autovacumm
+- wal writer
+- checkpointer
+- writer
+- stats collector
+- wal sender
+- wal receiver
+
+This processes can be configured with dozens of parameters, but:
+#+begin_quote
+general considerations will only help you select more or less adequate initial values; later on, these settings have to be fine-tuned based on monitoring data.
+#+end_quote
+
+Processes interact with each other using shared memory allocated by the initial process, postmaster.
+
+Postgres uses RAM to cache recent read pages in what's called the buffer cache, that live in the shared memory.
+
+In case of failure, RAM is lost, so Postgres maintains the write-ahead log (WAL) to restore data when it restarts.
+
+#+begin_quote
+PostgreSQL (almost) never bypasses the operating system mechanisms to use direct I/O, so it results in double caching.
+#+end_quote
+I'm very interested about that /almost/.
+
+*** Clients and the Client-Server Protocol
+
+Everytime a new client appears, =postmaster= creates a new separate backend process, that handles the session for this client.
+
+Having a process for every single client can have an important overhead on the server. This is solved by using a connection pooling, which makes clients share processes.
+
+The protocol used is based on the standard =libpq= library. Each connection is done on behalf of a role or user, and to a particular database. When connecting, authentication is performed.
+
+** Chapter 2: Isolation
+
+*** Consistency
+
+- Consistency = data correctness
+- Data integrity at the DB level: constraints such as =NOT NULL= or =UNIQUE=.
+- Data consistency is stricter than data integrity, and it's the app who must ensure it is not broken.
+- Using a transaction is the way to let the DB know that a set of operations constitute a whole.
+- Transactions that run concurrently can also operate incorrectly. We need to isolate them from each other.
+- Full isolation is hard and affect performance, so we may accept weaker levels of isolation, leaving the job of maintaining data consistency to the application.
+
+#+begin_quote
+A transaction is a set of operations that takes the database from one correct state to another correct state (consistency), provided that it is executed in full (atomicity) and without being affected by other transactions (isolation).
+#+end_quote
+
+*** Isolation Levels and Anomalies Defined by the SQL Standard
+
+Isolation levels, specified in the SQL standard, are defined by the anomalies that may or may not occur.
+
+There are many more known anomalies, but the isolation levels are only defined on a few (this is probably for historical reasons, as they were the known anomalies when the standard was written). The author *believes* that the levels come from the number of locks required for their implementation, as it was assumed that isolation had to be based on locks (see Two-phase locking protocol (2pl)):
+- Read uncommited: rows to update locked for writes but not for reads.
+- Read commited: rows to update locked for writes and for reads.
+- Repeatable read: rows to read and to update locked for writes and for reads.
+- Serializable: impossible only with locks on rows, since you cannot lock a row that does not exist yet. Theoretical solution, never implemented: predicate locks (locks on conditions).
+
+The following sections explain each of these anomalies (and in which isolation levels are allowed). But first, a summary:
+
+| Level v / Anomaly > | Lost update | Dirty read | Non-repeatable read | Phantom read | Other anomalies |
+|---------------------+-------------+------------+---------------------+--------------+-----------------|
+| Read uncommited     | -           | yes        | yes                 | yes          | yes             |
+| Read commited       | -           | -          | yes                 | yes          | yes             |
+| Repeatable read     | -           | -          | -                   | yes          | yes             |
+| Serializable        | -           | -          | -                   | -            | -               |
+
+**** Lost Update (never allowed)
+
+- Transactions A and B read row R.
+- A and B update R based on what they read, without taking into account each other's update.
+
+**** Dirty Reads (allowed at Read Uncommited)
+
+- Transaction A reads and updates row R but does not commit.
+- Transaction B reads updated row R.
+- Transaction A then decides to roll back.
+
+**** Non-Repeatable Reads (allowed at Read Uncommited + Read Commited)
+
+- Transaction A reads row R.
+- Transaction B updates row R to R'.
+- Transaction A reads row R again, but it reads now R'.
+
+**** Phantom Reads (allowed at Read Uncommited + Read Commited + Repeatable Read)
+
+This is very similar to non-repeatable reads: instead of updating the row, a new row satisfying the condition is added.
+
+- Transaction A asks for rows that satisfy condition C, and obtains S.
+- Transaction B adds a new row that satisfies condition C, so the set becomes S'.
+- Transaction A asks for rows that satisfy condition C, but it obtains now S'.
+
+**** No Anomalies (only possible with Serializable)
+
+The Serializable level prevents *any* anomalies, even the ones we don't know about, so the application does not have to take isolation into account at all.
+
+*** Isolation Levels in PostgreSQL
+
+PostgreSQL does not use lock-based protocols (such as 2pl), but a multiversion flavor of the Snapshot Isolation (SI) protocol:
+- SI: Transactions read a snapshot of data at a particular point in time.
+- Multiversion: the DB can contain several versions of one row at any point.
+- It only uses locks when concurrently updating a row. Writes never lock reads, and reads never lock anything.
+
+The implementation of PostgeSQL is a bit different from what the standard defines. Dirty reads are always forbidden, so Read uncommited and Read commited are the same.
+
+| Level v / Anomaly > | Lost update | Dirty read | Non-repeatable read | Phantom read | Other anomalies |
+|---------------------+-------------+------------+---------------------+--------------+-----------------|
+| Read commited       | yes         | -          | yes                 | yes          | yes             |
+| Repeatable read     | -           | -          | -                   | -            | yes             |
+| Serializable        | -           | -          | -                   | -            | -               |
+
+**** Read Committed
+
+***** No dirty reads
+
+If a transaction is not commited, their updates are never seen elsewhere. Snapshots, yay!
+
+***** Non-repeatable reads
+
+#+begin_quote
+In a transaction, you must not take any decisions based on the data read by the previous operator, as everything can change in between.
+#+end_quote
+
+How to avoid these problems?
+- Replace procedural code with declarative one.
+- Use a single SQL operator.
+- Apply explicit locks (~SELECT FOR UPDATE~ or even ~LOCK TABLE~).
+
+***** Read skew
+
+This is a new anomaly:
+- Transaction A reads row R.
+- Transaction B updates row R to R' and row Q to Q'.
+- Transaction A reads row Q'.
+
+Transaction A should have read either R and Q, or R' and Q'.
+
+This can also happen with long-running transactions that call =VOLATILE= functions (which is the default volatility category).
+
+Q: Do we use these types of functions in Mattermost?
+
+***** Read skew instead of lost updates
+
+See the whole example in the book, page 50, very interesting.
+
+- ~UPDATE ... SET ... WHERE ... IN (SELECT ...)~ has two stages: 1. the rows to update are selected; 2. the rows are updated one by one.
+- An ongoing modification of one of those rows lock it for writing, but not for reading; so step 1. is executed normally and step 2. has to wait until the row is updated, getting
+
+Q: Do we have examples of this in Mattermost? I'm sure there are many.
+
+***** Lost updates
+
+Lost updates can happen if it's the application the one that stores the intermediate result.
+
+- Transaction A reads row R and the app stores the result.
+- Transaction B reads row R and the app stores the result.
+- Transaction B updates row R to R' based on what the app stored.
+- Transaction A updates row R to R'' based on what the app stored.
+
+R'' should have known about R' in the first place.
+
+**** Repeatable Read
+
+***** No non-repeatable and phantom reads
+
+There are no non-repeatable and phantom reads at the Repeatable read level. That is:
+
+#+begin_quote
+At this isolation level, you do not have to worry that something will change between operators.
+#+end_quote
+
+This is interesting, I should think more about it:
+
+#+begin_quote
+In the second session, let’s start another transaction, with the Repeatable Read level explicitly specified in the BEGIN command (the level of the first transaction is not important.
+#+end_quote
+
+***** Serialization failures instead of lost updates
+
+The read skew anomaly is prevented by failing the transaction that would cause it. The error is: =ERROR: could not serialize access due to concurrent update=.
+
+#+begin_quote
+A practical insight: if your application is using the Repeatable Read isolation level for writing transactions, it must be ready to retry transactions that have been completed with a serialization failure. For read-only transactions, such an outcome is impossible.
+#+end_quote
+
+***** Write skew
+
+This is yet another anomaly, that can happen in the Repeatable read level:
+- Transaction A reads some data, and verifies that after an update U, condition C is satisfied.
+- Transaction B reads some data, and verifies that after an update U, condition C is satisfied.
+- If any of A or B would have known about the other one, they would have seen that after the second update U, condition C is no longer satisfied.
+
+This one's bad.
+
+***** Read-only transaction anomaly
+
+A new one that Repeatable read allows. Too complex to specify in general terms. See example in the book, page 57.
+
+**** Serializable
+
+#+begin_quote
+Thus, if an application uses the Serializable isolation level, it must be ready to retry transactions that have ended with a serialization failure. (The Repeatable Read level requires the same approach unless the application is limited to read-only transactions.)
+#+end_quote
+
+***** No anomalies
+
+Write-skew and read-only transaction anomalies always fail with the error:
+
+#+begin_src
+ERROR: could not serialize access due to read/write dependencies among transactions
+DETAIL: Reason code: Canceled on identification as a pivot, during commit attempt.
+HINT: The transaction might succeed if retried.
+#+end_src
+
+***** Deferring a read-only transaction
+
+We can defer the read-only transaction until it's safe by declaring it as =READ ONLY DEFERRABLE=.
+
+Q: Do we need both? What are the advantages of using only =READ ONLY= or only =DEFERRABLE=? Take a look at the Postgres manual.
+
+*** Which Isolation Level to Use?
+
+- Read Commited: default, convenient, but all anomalies have to be kept in mind when developing. Hard to reproduce the bugs that will happen.
+- Repeatable Read: modify the app to handle serialization failures. For read-only transactions, perfect complment to the Read Committed level.
+- Serializable: just have to worry about retrying any transaction that fails with a serialization error. Overhead reduce system throughput. **Not supported on replicas** and cannot be combined with other isolation levels
+
+** Chapter 3: Pages and Tuples
+
+*** Page Structure
+
+Each page has several parts; of which only the header has a fixed size (24 bytes):
+
+| Part                   | Location            | Contents                                                       |
+|------------------------+---------------------+----------------------------------------------------------------|
+| Page header            | [0, 24)             | Page checksum, values of =lower=, =upper= and =special=        |
+| Array of item pointers | [24, lower)         | Pointers to rows (4 bytes each): offset + length + status bits |
+| Free space             | [lower, upper)      | Never fragmented 😎                                            |
+| Items (row versions)   | [upper, special)    | Row versions for tables; rows references for indexes           |
+| Special space          | [special, pagesize) | Some indexes store auxiliary info                              |
+
+The sizes of each part can be shown using the =pageinspect= extension, using:
+
+#+begin_src sql
+CREATE EXTENSION pageinspect;
+
+SELECT lower, upper, special, pagesize
+FROM page_header(get_raw_page('accounts',0));
+#+end_src
+
+The array of item pointers is the mechanism used by indexes to:
+- Have unique references to rows.
+- Allow moving rows around in the page to avoid fragmentation.
+
+Thus, instead of the indexes directly referencing the row offset, they reference a pointer in that array, which in turns points to the offset of the row. This way, we can have a unique reference to the row while we can move the row around in the page (we just need to update the offset in the pointer, not the pointer itself).
+
+*** Row Version Layout
+
+Each row has a header followed by actual data. The header (min 23 bytes) contains, among others:
+- =xmin=, =xmax=: transaction IDs used to discriminate among different versions of the same row.
+- =infomask=: set of bits giving info on the versioning of the row. Two important pairs are:
+  - =xmin_committed= and =xmin_aborted=: if set, the =xmin= transaction has been committed/aborted.
+  - =xmax_committed= and =xmax_aborted=: if set, the =xmax= transaction has been committed/aborted.
+- =ctid=: pointer to the next updated version of the same row.
+- =null bitmap=: array of bits marking NULL-able columns.
+
+The row header is often larger than the row data 😮
+
+#+begin_quote
+Data layout on disk fully coincides with data representation in RAM. The page along with its tuples is read into the buffer cache as is, without any transformations. That's why data files are incompatible between different platforms.
+#+end_quote
+
+- The size of a tuple depends on the order of fields because of data alignment.
+
+*** Operations on Tuples
+
+All versions of all rows are marked with two values: =xmin= and =xmax=. They are (ever-increasing) transaction IDs that define the "validity time" of the specific version:
+- Create row: =xmin= is set to the transaction ID of the =INSERT= command.
+- Delete row: =xmax= is set to the transaction ID of the =DELETE= command.
+- Update row:
+  - Old row version is "deleted": =xmax= is set to the transaction ID of the =UPDATE= command.
+  - New row version is "inserted": =xmin= is set to the transaction ID of the =UPDATE= command.
+
+**** Insert
+
+1. Begin a transaction =T=.
+2. Execute an =INSERT= command.
+3. The =xmin= value of the new row version is set to the ID of =T=. =xmin_committed= and =xmin_aborted= are not modified.
+
+❓ They're not modified? Or are they explicitly unset?
+
+**** Commit (CLOG and ProcArray)
+
+There are two additional structures in the server's shared memory:
+- The commit log (CLOG): it contains two bits per transaction: one for committed, one for aborted
+- The ProcArray: a list of all the active processes: for each process, its current transaction is specified.
+
+These two structures are used whenever a **new** transaction reads the row version from the page, to know if it's not visible (active, not committed or aborted):
+1. To check if it's active, it reads the ProcArray. If it's there, then it does nothing else.
+2. To check if it's committed/aborted, it reads the CLOG. Once determined, this new transaction sets the =xmin_committed= and =xmin_aborted= information bits (hint bits) in the original row version, so that future transactions don't need to read the CLOG.
+
+The sensible approach would be for the original transaction to set the =xmin_commited= and =xmin_aborted= bits itself directly, instead of setting the bits in the CLOG and letting the next transaction to set the bits in the page. But that's impossible because of two reasons:
+1. At that time, it is not known whether this transaction will complete successfully.
+2. If a transaction affects many pages, it may be too expensive to track them.
+
+❓ I may understand 2 for performance reasons, but I don't get 1.
+
+#+begin_quote
+The flip side of this cost reduction is that any transaction (even a read-only =SELECT= command) can start setting hint bits, thus leaving a trail of dirtied pages in the buffer cache.
+#+end_quote
+
+❓ I don't get the bit about the trail of dirtied pages. When those bits are set, isn't it already clear what happened?
+
+**** Delete
+
+1. Begin a transaction =T=.
+2. Execute a =DELETE= command.
+3. The =xmax= value of the current row version is set to the ID of =T=. =xmin_aborted= is unset.
+
+❓ Is =xmin_aborted= explicitly unset? If so, why?
+
+**** Abort
+
+As in =COMMIT=, nothing changes in the page itself, only the CLOG is modified. When a new transaction accesses that row, then the =xmin_aborted= bit is set.
+
+**** Update
+
+1. Begin a transaction =T=.
+2. Execute an =UPDATE= command.
+3. A virtual delete+insert happens:
+   1. The =xmax= value of the old row version is set to the ID of =T=. =xmax_aborted= is unset because this transaction may be rolled back.
+   2. The =xmin= value of the new row version is set to the ID of =T=.
+
+❓ What happens with the other bits? It's not clear to me whether they're unmodified or explicitly unset.
+
+*** Indexes
+
+- Indexes do not use row versioning -> Index row headers do not contain =xmin= and =xmax= fields.
+- How is visibility determined? Just access the table (there's another mechanism with the visibility map, but not explained here).
+
+*** TOAST
+
+- Rows of TOAST tables are handled in such a way that they are never updated; they can be either added or deleted.
+- Data modifications that do not affect long values don't change the TOAST table.
+- Data modifications that do affect long values force the creation of new toasts.
+
+*** Virtual transactions
+
+- Transactions do not get a permanent, unique, transaction ID until they perform some write. If they are read-only, they do not consume any real transaction ID.
+
+*** Subtransactions
+
+- When using a savepoint in a transaction, the subtransaction gets a new (higher than the parent's) transaction ID.
+- Everything works the same for subtransactions, but:
+  - The committed and aborted bits are set at the same time.
+  - The final decision is made when the parent transaction is committed or aborted.
+- The information about subtransactions is stored under the =pgdata/pg_subtrans/= directory. Same structure as CLOG buffers.
+- After a failure in a transaction, all remaining changes are aborted; otherwise, atomicity would not be respected.
+  - If we use ~\set ON_ERROR_ROLLBACK on~; this behaviour is not followed. To do so, Postgres implicitly encapsulates each statement in a subtransaction.
+
+** Chapter 4: Snapshots
+
+*** What is a Snapshot?
+
+- A snapshot is, logically, the set of rows that are visible to a transaction. It's what puts the C in ACID (consistency).
+- The moment a snapshot is taken depends on the isolation level:
+  - Read Commited: at the beginning of each statement. Active only during that statement.
+  - Repeateable Read and Serializable: at the beginning of the first statement of a transaction. Active during the whole transaction.
+
+*** Row Version Visibility
+
+- A snapshot does not contain copy of any data. It is a definition of what rows are visible when the snapshot was taken.
+- Tuple visibility is defined by its =xmin= and =xmax= values. =[xmin, xmax]= intervals do not intersect, so just one version of each row can be visible.
+  - Although exact rules are complex, the gist of it is: a tuple is visible in a snapshot that includes =xmin= transaction changes but excludes =xmax= transaction changes.
+- The changes from a transaction are visible in a snapshot if the transaction was committed before the snapshot was taken.
+
+*** Snapshot Structure
+
+- Postgres does not know when a transaction is committed, only when it is started.
+- But we can know what the current status of a transaction is through the =ProcArray= structure living in the server's shared memory.
+- If a transaction completes, we cannot know whether it was active at some point in time; specifically, at the point a snapshot was taken. Some corollaries:
+  - A snapshot needs to collect the status of all the transactions at that moment.
+  - A snapshot cannot be made at some arbitrary point in the past, only now.
+- Some of the values stored with a snapshot, all relative to the moment of its creation, are:
+  - =xmin=: ID of the oldest active transaction. Smaller IDs are committed or aborted.
+  - =xmax=: ID of the latest committed transaction plus one. Equal or larger IDs are still running or do not exist.
+  - =xip_list=: IDs of all active transactions (except for virtual ones).
+- See pages 90-92 for an example.
+- Changes are included into a snapshot if they are made by transactions whose =xid= satisfy either of:
+  1. =xid < xmin=
+  2. =xmin ≤ xid < xmax= and =xid not in xip_list=
+
+*** Visibility of Transactions' Own Changes
+
+- A cursor is an iterator-like variable containing a reference to a query that can later be fetched.
+- Cursors in a transaction need to see the state of rows when they were opened, avoiding any later changes.
+- This is accomplished by:
+  - Storing =cmin= and =cmax= values in tuple header: they contain the sequence number of the operation within the transaction (=cmin= for inserts, =cmax= for deletions). These values are actually stored in a single field, since it's assumed a row will not be inserted and deleted in the same transaction (the edge case is handled by a special combo identifier).
+  - Storing the =cmin=/=cmax= value in the snapshot (this cannot be retrieved using SQL).
+  - Comparing the tuple header =cmin=/=cmax= value with the snapshot's value. If the snapshot's value is lower than the tuple's value, then that tuple is not visible.
+
+*** Transaction Horizon
+
+- The horizon of a transaction is defined as its lower boundary; i.e., its =xmin= value; i.e., the ID of the oldest transaction that was active when the snapshot was created.
+  - All transactions with =xid < xmin= are guaranteed to be committed.
+  - A transaction can only see the row versions beyond its horizon.
+- The horizon of a database is the oldest horizon of all transactions; i.e., the oldest =xmin=
+  - Before this horizon, all outdated heap tuples will never be visible to any transaction.
+  - Such tuples can be safely vacuumed.
+- Conclusion:
+  - If a transaction (real or virtual for Repeatable Read or Serializable, or real for Read Committed) is running for a long time, it holds the database horizon and defer vacuuming.
+  - A virtual transaction in Read Committed holds the horizon only while executing operators.
+- Transaction horizon can be seen with ~SELECT backend_xmin FROM pg_stat_activity WHERE pid = pg_backend_pid()~.
+#+begin_quote
+In a perfect world, you should avoid combining long transactions with frequent updates (that spawn new row versions), as it will lead to table and index bloating.
+#+end_quote
+
+*** System Catalog Snapshots
+
+- Transactions have access to the latest changes in system catalog tables, even if they happen after a snapshot is created.
+- For example, an INSERT command can see new integrity constraints in a table that were added after the snapshot was created.
+
+- ❓ Doesn't this break isolation? The following does not clarify it:
+#+begin_quote
+It may seem that such behavior breaks isolation, but if the inserting transaction had accessed the accounts table, the =ALTER TABLE= command would have been blocked until this transaction completion.
+#+end_quote
+
+*** Exporting Snapshots
+
+- Snapshots can be reused!
+- Just use the =pg_export_snapshot()=, which gives an ID that can be used in another transaction with =SET TRANSACTION SNAPSHOT 'pg_export_snapshot-id'=.
