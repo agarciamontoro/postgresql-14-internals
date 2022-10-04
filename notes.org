@@ -551,6 +551,14 @@ In a perfect world, you should avoid combining long transactions with frequent u
 It may seem that such behavior breaks isolation, but if the inserting transaction had accessed the accounts table, the =ALTER TABLE= command would have been blocked until this transaction completion.
 #+end_quote
 
+It turns out it was just that the wording of the sentence was a bit confusing. I had a quick chat with the author and the translator and they agreed to change the previous sentence to:
+#+begin_quote
+It may seem that such behavior breaks isolation, but if the inserting transaction had managed to reach the accounts table before the =ALTER TABLE= command, the latter would have been blocked until this transaction completed.
+#+end_quote
+
+The thing is that the inserting command is done after the =ALTER TABLE= command completes. If it would have been the other way around, then the =ALTER TABLE= would have blocked and added the integrity check after the inserting command had successfully added the row with the =NULL= value.
+
+
 *** Exporting Snapshots
 
 - Snapshots can be reused!
