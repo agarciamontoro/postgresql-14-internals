@@ -563,3 +563,72 @@ The thing is that the inserting command is done after the =ALTER TABLE= command 
 
 - Snapshots can be reused!
 - Just use the =pg_export_snapshot()=, which gives an ID that can be used in another transaction with =SET TRANSACTION SNAPSHOT 'pg_export_snapshot-id'=.
+
+** Chapter 5: Page Pruning and HOT Updates
+
+*** Page Pruning
+
+- Leveraging accesses to pages (to read or update), some pruning may happen when:
+  - The previous =UPDATE= couldn't place a new tuple into the same page (reflected in the header).
+  - The page contains more data than the =fillfactor= parameter.
+- Pruning removes tuples beyond the database horizon in a single page.
+- Any =SELECT= statement can cause page modifications (because it prunes old tuples).
+- Pointers to pruned tuples remain in place (they may be referenced from an index).
+- When pruning a page, the index page is not touched. That happens, of course, when accessing the index page itself (e.g. with an index scan).
+- See example in pages 101-104.
+
+*** HOT Updates
+
+- When a column is updated, all indexes that reference it need to be updated as well (i.e. a new entry is added to the index) so they point to the new version of the row, since the key has changed.
+- When updating a column that is not in *any* index, there is no need to add entries to indexes with the exact same key.
+- An update involving columns that do not appear in any index are called Heap-Only Tuple (HOT) updates. All the other ones are called cold (or non-HOT) updates.
+- In the case of a HOT update:
+  - Indexes contain just one entry for all versions of a row. This entry points to the original version.
+  - All subsequent versions in the same page are found following the =ctid= pointers of the tuples (the HOT chain,).
+  - The tuples in the HOT chain are checked for visibility in the index scans.
+  - The new row versions not pointed to by any index are tagged with the HOT bit.
+  - Row versions in a HOT chain that have following versions are tagged with Heap HOT Updated (HHU) bit.
+- See example in p. 106.
+#+begin_quote
+A HOT update is possible if the modified fields are not a part of any index. Otherwise, some of the indexes would contain a reference to a heap tuple that appears in the middle of the chain, which contradicts the idea of this optimization.
+#+end_quote
+- ❓ I am not sure why updating a column in an index A would not let us start a HOT chain for an index B that does not reference it, but I think I understand it now. Is this correct?
+  - The case of an already started HOT chain that now updates a column in index A not referenced for index B makes sense, since we would need to have some kind of tree of chains, which is probably too costly.
+  - But let's say that we *start* one HOT chain updating a column referenced by index A. In this case, this chain is only used by index B.
+  - Index A still points to the new versions of the rows, which are now marked as HOT only for B.
+  - We need to store that information somewhere, and the only sensible place to do so would be the tuples in the page.
+  - But then, we'd need to store for which indexes that tuple is marked as HOT, which would be too costly.
+  - We could also store for which indexes this tuple is *not* HOT.
+  - In any case, that probably introduces too much complexity (?)
+  - So we narrow the focus of HOT updates to columns that are not in *any* index.
+
+*** Page Pruning for HOT Updates
+
+- When page pruning happens and there's a HOT chain in the page, some special steps are taken:
+  - The head of the chain needs to remain, since indexes point to it. Others can be released.
+  - The head of the chain changes to a redirect state.
+  - The head of the chain points now to the tuple that currently starts the chain.
+  - All unused tuples are pruned, and new tuples can now reclaim their space.
+- ❓ Not sure I understand this:
+#+begin_quote
+If unindexed columns are modified frequently, it makes sense to reduce the fillfactor value, thus reserving some space in the page for updates. Obviously, you have to keep in mind that the lower the fillfactor value is, the more free space is left in the page, so the physical size of the table grows.
+#+end_quote
+
+*** HOT Chain Splits
+
+- HOT chains are isolated to a single page.
+- If the page runs out of space when adding a new tuple:
+  - The new tuple is created in another page.
+  - A new index entry is created to refer to the new tuple (which may start another HOT chain by itself).
+
+*** Page Pruning for Indexes
+
+- Two separate index pages are never merged into one, which leads to index bloating.
+- To try to avoid this, Postgres tries to defer splitting a page as much as it can by pruning a page.
+- Pruning happens when an insertion into a B-tree is about to split the page into two.
+- Two types of tuples can be pruned in this case:
+  - Tuples tagged as dead during an index scan because the pointed tuple is not visible or does not exist.
+  - Tuples that point to different versions of the same table row.
+    - Postgres check visibility of heap tuples, which require table access.
+    - This is only performed for "promising" index tuples ("copies of the existing ones for MVCC purposes"❓).
+    - "It is cheaper to perform such a check than to allow an extra page split"
