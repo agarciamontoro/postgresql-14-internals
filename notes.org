@@ -90,7 +90,7 @@ Each row must fit a single page: there is no way to continue a row on the next p
 #+end_quote
 Is this a design decision? Is there any other solution that could have worked here?
 
-When a long attribute is used in a table, it is not physically stored in the table itself, but on an ancillary table called TOAST (from The Oversized Attributes Storage Technique). This is done because every row must fit in a single page, which usually has 8192 KB (ideally, each page should accommodate four rows): if one does not (e.g., a JSON or TEXT column has a lot of data that even compressed does not fit in one page), then the data is either:
+When a long attribute is used in a table, it is not physically stored in the table itself, but on an ancillary table called TOAST (from The Oversized Attributes Storage Technique). This is done because every row must fit in a single page, which usually has 8192 B (ideally, each page should accommodate four rows): if one does not (e.g., a JSON or TEXT column has a lot of data that even compressed does not fit in one page), then the data is either:
 - sliced into smaller "toasts"
 - compressed
 - both sliced and compressed
@@ -556,8 +556,7 @@ It turns out it was just that the wording of the sentence was a bit confusing. I
 It may seem that such behavior breaks isolation, but if the inserting transaction had managed to reach the accounts table before the =ALTER TABLE= command, the latter would have been blocked until this transaction completed.
 #+end_quote
 
-The thing is that the inserting command is done after the =ALTER TABLE= command completes. If it would have been the other way around, then the =ALTER TABLE= would have blocked and added the integrity check after the inserting command had successfully added the row with the =NULL= value.
-
+The thing is that the inserting command is done after the =ALTER TABLE= command completes. If it would have been the other way around, then the =ALTER TABLE= would have blocked and added the integrity check after the inserting command had successfully added the row with the NULL value.
 
 *** Exporting Snapshots
 
@@ -584,7 +583,7 @@ The thing is that the inserting command is done after the =ALTER TABLE= command 
 - An update involving columns that do not appear in any index are called Heap-Only Tuple (HOT) updates. All the other ones are called cold (or non-HOT) updates.
 - In the case of a HOT update:
   - Indexes contain just one entry for all versions of a row. This entry points to the original version.
-  - All subsequent versions in the same page are found following the =ctid= pointers of the tuples (the HOT chain,).
+  - All subsequent versions in the same page are found following the =ctid= pointers of the tuples (the HOT chain).
   - The tuples in the HOT chain are checked for visibility in the index scans.
   - The new row versions not pointed to by any index are tagged with the HOT bit.
   - Row versions in a HOT chain that have following versions are tagged with Heap HOT Updated (HHU) bit.
