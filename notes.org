@@ -631,3 +631,152 @@ If unindexed columns are modified frequently, it makes sense to reduce the fillf
     - Postgres check visibility of heap tuples, which require table access.
     - This is only performed for "promising" index tuples ("copies of the existing ones for MVCC purposes"❓).
     - "It is cheaper to perform such a check than to allow an extra page split"
+
+** Chapter 6: Vaccuum and Autovacuum
+
+*** Vacuum
+
+- Page pruning is fast but narrow-scoped.
+- The =VACUUM= command processes a whole table, removing dead heap tuples *and* corresponding index entries.
+- Vacuuming can happen in parallel with other processes (with some exceptions, as =CREATE INDEX= or =ALTER TABLE=).
+- The visibility map tracks which pages contain only current tuples, so those can be skipped when vacuuming.
+- Visibility/free space maps and vacuuming:
+  - The visibility map contains the pages that only have current tuples: these can be skipped when vacuuming.
+  - After vacuuming, if all remaining tuples are current, the visibility map will now include this page.
+  - After vacuuming, the free space map is updated to reflect the space that has been cleared.
+
+*** Database Horizon Revisited
+
+- Vacuuming remove dead tuples based on the database horizon. If a transaction is holding it, some tuples may not be eliminated.
+- =VACUUM VERBOSE tablename;= let us see how many tuples are eliminated or skipped and the database horizon.
+
+*** Vacuum Phases
+
+In short:
+1. The table is scanned in search of dead tuples
+2. Dead tuples are removed from the index
+3. Dead tuples are removed from the table
+4. Repeat 1-3 if there are too many dead tuples
+5. Perform heap truncation
+
+**** 1. Heap Scan
+
+- All pages in the visibility map are skipped
+- For all other pages: if a tuple is beyond the horizon, its ID is added to a =tid= array.
+- The =tid= array is in the local memory of the =VACUUM= process
+- The whole memory chunk (size defined by =maintenance_work_mem= parameter) is allocated at once.
+- ❓ Doesn't the following contradict the previous affirmation?
+#+begin_quote
+the allocated memory never exceeds the volume required in the worst-case scenario, so if the table is small, vacuuming may use less memory than specified in this parameter.
+#+end_quote
+- Two possible outcomes:
+  - The table is scanned in full
+  - The =tid= array is filled before the scanning finishes
+- In either case, we continue with the next phase.
+
+**** 2. Index Vacuuming
+
+- For *each* index in the table (even if it's not the first time we scanned the heap)
+  - The index is *fully* scanned to find entries that refer to tuples in the =tid= array.
+  - Such entries are removed from the index pages.
+  - The free space map is updated.
+  - Statistics on vacuuming are collected.
+- This process can be run in parallel with a single worker per index.
+- If rows are only inserted (so the =tid= array is empty because there are no dead tuples) this phase is skipped, but an index scan is forced once at the end as part of a separate phase of *index cleanup*.
+
+**** 3. Heap Vacuuming
+
+- The table is scanned again to:
+  - Remove tuples registered in the =tid= array.
+  - Free the corresponding pointers.
+- The free space and the visibility maps are updated.
+- If the table was not fully scanned in 1., the =tid= array is cleared and 1. is resumed.
+
+**** 4. Heap Truncation
+
+- In the previous phase, we can end up with several empty pages at the end of the file (a tail). ❓ How are all in the end?
+- If that chunk of free space is at least 1/16 of the table or there are at least 1000 pages, then:
+  - The =VACUUM= process locks the table (for a short time).
+  - This tail is returned to the operating system as free space.
+
+*** Analysis
+
+- The =ANALYZE= command collects statistical information for the query planner, such as:
+  - Number of rows (=pg_class.reltuples=).
+  - Number of pages (=pg_class.relpages=).
+  - Data distribution within columns.
+- The =VACUUM ANALYZE= command appeared before a separate =ANALYZE= command.
+- Even if running =VACUUM ANALYZE=, these two processes are performed sequentially.
+- However, automatic vacuum and analysis are set up in a similar way.
+
+*** Automatic Vacuum and Analysis
+
+- Autovacuum launches vacuum and analysis processes based on the intensity of table updates.
+
+**** About the Autovacuum Mechanism
+
+- The =autovacuum launcher= process is always running (if =autovacuum= and =track_counts= parameters are enabled).
+- It defines the autovacuum schedule and maintains a list of active databases.
+- Once in =autovacuum_naptime= (1min by default):
+  - An =autovacuum worker= starts for each active database (always less workers than =autovacuum_max_workers=)
+  - The worker connects to the corresponding database and builds:
+    - a list of all tables, materialized views and TOAST tables to be vacuumed
+    - a list of all tables and materialized views to be analyzed (TOAST tables don't need to be analyzed because they're always accessed via an index)
+  - The objects in the list are vacuumed or/and analyzed
+  - The worker is terminated.
+  - If the worker doesn't finish in =autovacuum_naptime=, another worker is spawned to process different tables in parallel (there's no parallelism at the table level).
+- Differences between regular vacuum and autovacuum:
+  - Separate parameters to define =tid= arrays: =maintenance_work_mem= and =autovacuum_work_mem=. By default, =autovacuum_work_mem= equals =maintenance_work_mem=.
+  - Parallel processing a table's indexes happen only for vacuum; not allowed for autovacuum.
+
+**** Which Tables Need to be Vacuumed?
+
+- The statistics collector is constantly updating two counters in the =pg_stat_all_tables= table:
+  - =n_dead_tup=: Number of dead tuples in a table.
+  - =n_ins_since_vacuum=: Number of rows inserted since last vacuum.
+- Vacuuming is triggered for two reasons:
+  1. Dead tuple accumulation
+     - Vacuum happens if =n_dead_tup > abs + rel * n_tup=, where:
+       - =abs= is controlled by =autovacuum_vacuum_threshold=, an absolute number of dead tuples.
+       - =rel= is controlled by =autovacuum_vacuum_scale_factor=, a fraction of dead tuples in a table.
+       - =n_tup= is the =pg_class.reltuples= counter, an estimate of the number of live rows in a table.
+  2. Insertion of new rows
+     - If rows are only inserted, there are no dead tuples.
+     - However, in order to enable index-only scans, vacuuming needs to happen to freeze heap tuples in advance and update the visibility map.
+     - Vacuum happens if =n_ins_since_vacuum > abs + rel * n_tup=, where:
+       - =abs= is controlled by =autovacuum_vacuum_insert_threshold=, an absolute number of rows inserted since last vacuum.
+       - =rel= is controlled by =autovacuum_vacuum_insert_scale_factor=, a fraction of new rows in a table since last vacuum.
+       - =n_tup= is the =pg_class.reltuples= counter, an estimate of the number of live rows in a table.
+- All the previous thresholds can be overridden at the table level.
+  - The default value of =autovacuum_vacuum_scale_factor= is 20%, which may be too big for large tables.
+  - The optimal parameters depend on the table size and workload type (but no tips are given).
+  - There are corresponding parameters for the thresholds for TOAST tables, with the same name and prefixed by =toast.=.
+
+
+**** Which Tables Need to Be Analyzed?
+
+- Analysis processes only modified rows, so the frequency depends only on that.
+- The statistics collector is constantly updating one counter more in the =pg_stat_all_tables= table:
+  - =n_mod_since_analyze=: Number of rows modified in a table since last analysis.
+- Analysis happens if =n_mod_since_analyze > abs + rel * n_tup=, where:
+  - =abs= is controlled by =autovacuum_vacuum_analyze_threshold=, an absolute number of rows inserted since last vacuum.
+  - =rel= is controlled by =autovacuum_vacuum_analyze_scale_factor=, a fraction of new rows in a table since last vacuum.
+  - =n_tup= is the =pg_class.reltuples= counter, an estimate of the number of live rows in a table.
+- All the previous thresholds can be overridden at the table level.
+- TOAST tables are not analyzed.
+
+**** Autovacuum in Action
+
+- See example in pages 126-130
+
+*** Managing the Load
+
+**** Vacuum Throttling
+
+**** Autovacuum Throttling
+
+*** Monitoring
+
+**** Monitoring Vacuum
+
+**** Monitoring Autovacuum
