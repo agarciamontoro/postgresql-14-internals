@@ -768,15 +768,49 @@ the allocated memory never exceeds the volume required in the worst-case scenari
 **** Autovacuum in Action
 
 - See example in pages 126-130
+- Typo in page 128: it should read 1000 instead of 1006
 
 *** Managing the Load
 
+- Vacuuming can have a noticeable impact on performance even if it does not block other processes.
+
 **** Vacuum Throttling
+
+- Manual vacuum can be throttled with two parameters:
+  - =vacuum_cost_limit=: controls the amount of work done after which the process sleeps (default 200)
+    - Each page read from the buffer cache costs =vacuum_cost_page_hit= (default 1)
+    - Each page read not in the buffer cache costs =vacuum_cost_page_miss= (default 2)
+    - Each page dirtied by vacuum (i.e., that needs to ) costs =vacuum_cost_page_dirty= (default 20)
+  - =vaccum_cost_delay=: controls the amount of time the process is sleeping (default 0)
+- With default values, between 9 and 200 pages per cycle are processed.
 
 **** Autovacuum Throttling
 
+- Same two parameters, prefixed by =autovacuum=:
+  - =autovacuum_vacuum_cost_limit=: defaults to -1, which means fallback to =vacuum_cost_limit=.
+    - No different =cost_page_{hit,miss,dirty}=.
+  - =autovacuum_vaccum_cost_delay=: defaults 2ms, -1 means fallback to =vacuum_cost_delay=.
+- These values are shared between all workers
+  - Regardless of the number of workers, the impact on the system is similar
+  - If autovacuum needs to be sped up, both =autovacuum_max_workers= and =autovaccum_vacuum_cost_limit= should be increased.
+- These values can be overridden by table (same name) and for TOAST tables (same name prefixed by =toast.=).
+
 *** Monitoring
+
+- Monitoring vacuum processes can detect cases where dead tuples cannot be removed in one go (because they don't fit in the =maintenance_work_mem=-sized memory chunk).
+  - In this case, all indexes have to be fully scanned several times
+  - This can be fixed by either vacuuming more often or allocating more memory
 
 **** Monitoring Vacuum
 
+- Run =VACUUM= with the =VERBOSE= clause
+- Views with current state of started processes:
+  - =pg_stat_progress_vacuum= for vacuum.
+  - =pg_stat_progress_analyze= for analyze (usually very fast and unlikely to cause issues).
+-
+
 **** Monitoring Autovacuum
+
+- Set =log_autovacuum_min_duration= to something other than the default value of -1
+- To track tables that need vacuuming or analysis, we can use the views defined in the chapter (=need_vacuum= and =need_analyze=).
+  - If the list of tables grows, either reduce =autovacuum_vacuum_cost_delay= or increase =autovacuum_vacuum_cost_limit= (maybe also increasing =autovacuum_max_workers=).
