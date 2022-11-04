@@ -814,3 +814,103 @@ the allocated memory never exceeds the volume required in the worst-case scenari
 - Set =log_autovacuum_min_duration= to something other than the default value of -1
 - To track tables that need vacuuming or analysis, we can use the views defined in the chapter (=need_vacuum= and =need_analyze=).
   - If the list of tables grows, either reduce =autovacuum_vacuum_cost_delay= or increase =autovacuum_vacuum_cost_limit= (maybe also increasing =autovacuum_max_workers=).
+
+** Chapter 7: Freezing
+
+*** Transaction ID Wraparound
+
+- Transaction ID: 32 bits (~4 billion possible IDs)
+  - 64-bits transaction IDs would be too large for the two (=xmin= and =xmax=) IDs in each tuple's header.
+- When exhausted, the counter has to be reset. This is called a wraparound.
+  - Age of a transaction T: the number of subsequent transactions that have appeared since the start of T.
+  - To handle wraparound, Postgres compare the age of transactions instead of transaction IDs.
+  - We use the terms older and younger instead of less and greater.
+#+begin_src c
+// TransactionIdPrecedes --- is id1 logically < id2?
+bool TransactionIdPrecedes(TransactionId id1, TransactionId id2) {
+    // If either ID is a permanent XID then we can just do unsigned
+    // comparison.  If both are normal, do a modulo-2^32 comparison.
+    int32 diff;
+
+    if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+        return (id1 < id2);
+
+    diff = (int32) (id1 - id2);
+    return (diff < 0);
+
+    id1 - 1d2 < 0
+}
+#+end_src
+  - ❓ Sooner or later, an old transaction that was once in the remote past will be seen as a future one. This has to be handled; otherwise, no snapshot would see such transaction anymore.
+
+*** Tuple Freezing and Visibility Rules
+
+- To prevent the above, vacuuming also searches for tuples beyond the database horizon and tags them in a special way; i.e., it freezes them.
+- Frozen tuples are visible in all snapshots, so their =xmin= is ignored, and that ID can be safely reused.
+- =xmin= is unchanged in the tuple; freezing is marked by the combination of both =committed= and =aborted= hint bits.
+- =xmax= does not participate in freezing in any way (it's only present in outdated tuples). When =xmax= is beyond the database horizon, such tuples will be vacuumed away.
+
+*** Managing Freezing
+
+- Four parameters control freezing:
+| Parameter                   | Default | Description                            |
+|-----------------------------+---------+----------------------------------------|
+| =vacuum_freeze_min_age=     | 50 M    | When does freezing start?              |
+| =vacuum_freeze_table_age=   | 150 M   | When is aggressive freezing performed? |
+| =autovacuum_freeze_max_age= | 200 M   | When is freezing forced?               |
+| =vacuum_failsafe_age=       | 1600 M  | When does freezing receive priority?   |
+
+
+**** Minimal Freezing Age
+
+- =vacuum_freeze_min_age= defines the minimal age of =xmin= transactions that are going to be frozen.
+- Lower value => higher overhead. If a row is actively being changed, freezing all new versions is a wasted effort.
+- This parameter can be overridden at the table level (normal and TOAST tables).
+
+**** Age for Aggressive Freezing
+
+- =vacuum_freeze_table_age= defines the transaction age that allows vacuuming to ignore the visibility map, so any heap page can be frozen.
+- Each table has an associated transaction ID for which all older transactions are sure to be frozen. It's in =pg_class.relfrozenxid=.
+- This transaction's age is compared to the =vacuum_freeze_table_age=  value to decide whether to start aggressive freezing.
+- The freeze map allows vacuuming to:
+  - skip pages that are in the map
+  - ensure fault tolerance: if vacuuming is interrupted, the next run will not need to process the pages already in the map, so no work is repeated.
+- Aggressive freezing of all pages is performed when the number of transactions in the system reaches =vacuum_freeze_table_age - vacuum_freeze_min_age= (100 M with default values)
+  - If =vacuum_freeze_min_age= is too big => higher overhead. ❓
+- This parameter can be overridden at the table level (normal and TOAST tables).
+
+**** Age for Forced Autovacuum
+
+- Autovaccum is forced, even if switched off, when there's risk that some unfrozen transaction IDs exceed the =autovacuum_freeze_max_age= value.
+- Decision taken based on the age of the oldest =pg_class.relfrozenxid= in all tables.
+- That ID is stored in =pg_database.datfrozenxid=.
+  - ❓ Is =datfrozenxid= the database horizon? We think this is always older than the horizon.
+- The value of =autovacuum_freeze_max_age= must be in [100k, 2000M].
+  - 2000M is a bit less than the max transaction ID.
+  - A big value increases the risk of wraparound, as postgres may fail to timely freeze all required tuples. In such a case, the server must stop immediately!
+- The =autovacuum_freeze_max_age= affects the size of CLOG, since there is no need to keep the status of frozen transactions and all transactions preceding =datfrozenxid= are sure to be frozen.
+- Changing =autovacuum_freeze_max_age= requires a server restart.
+- This parameter can be overridden at the table level (normal and TOAST tables).
+
+**** Age for Failsafe Freezing
+
+- If autovacuum cannot avoid the risk of wraparound, =autovacuum_vacuum_cost_delay= is ignored and it stop vacuuming indexes to freeze heap tuples instead.
+- This failsafe freezing mode is enabled if there is a risk that the age of an unfrozen transaction in the database will exceed the =vacuum_failsafe_age= value, which is assumed to be higher than =autovacuum_freeze_max_age=.
+
+*** Manual Freezing
+
+**** Freezing by Vacuum
+
+- =VACUUM FREEZE= will freeze all heap tuples as if =vacuum_freeze_min_age= is 0.
+- If this is done, it makes sense to disable index vacuuming. Two alternatives:
+  - =VACUUM (freeze, index_cleanup false)=
+  - Via the =vacuum_index_cleanup= storage parameter: =ALTER TABLE t SET (vacuum_index_cleanup = FALSE)=.
+
+**** Freezing Data at the Initial Loading
+
+- =COPY ... WITH FREEZE= inserts and freezes data at once.
+  - Useful for data that is not expected to change.
+  - Tuples can be frozen during the initial loading only if the resulting table has been created or truncated within the same transaction, as both these operations acquire an exclusive lock on the table.
+  - Isolation level can be broken here! T1 begins; T2 truncates a table, copy-freeze data and commit; and then T1 can see that data!
+    - This is allowed because data loading is unlikely to happen regularly. "In most cases it will not cause any issues".
+  - When loading data with freezing, visibility map is created at once, and page headers receive the visibility attribute (so it won't be processed by vacuum while data remains unchanged).
