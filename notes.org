@@ -752,7 +752,6 @@ the allocated memory never exceeds the volume required in the worst-case scenari
   - The optimal parameters depend on the table size and workload type (but no tips are given).
   - There are corresponding parameters for the thresholds for TOAST tables, with the same name and prefixed by =toast.=.
 
-
 **** Which Tables Need to Be Analyzed?
 
 - Analysis processes only modified rows, so the frequency depends only on that.
@@ -860,7 +859,6 @@ bool TransactionIdPrecedes(TransactionId id1, TransactionId id2) {
 | =autovacuum_freeze_max_age= | 200 M   | When is freezing forced?               |
 | =vacuum_failsafe_age=       | 1600 M  | When does freezing receive priority?   |
 
-
 **** Minimal Freezing Age
 
 - =vacuum_freeze_min_age= defines the minimal age of =xmin= transactions that are going to be frozen.
@@ -914,3 +912,100 @@ bool TransactionIdPrecedes(TransactionId id1, TransactionId id2) {
   - Isolation level can be broken here! T1 begins; T2 truncates a table, copy-freeze data and commit; and then T1 can see that data!
     - This is allowed because data loading is unlikely to happen regularly. "In most cases it will not cause any issues".
   - When loading data with freezing, visibility map is created at once, and page headers receive the visibility attribute (so it won't be processed by vacuum while data remains unchanged).
+
+** Chapter 8: Rebuilding Tables and Indexes
+
+*** Full Vacuuming
+
+**** Why is Routine Vacuuming not Enough?
+
+- =VACUUM= can rarely reduce the number of pages: only if several empty pages appear at the very end (this does not happen often).
+- Consequences of excessive size:
+  - Table/index scans will take longer.
+  - Bigger buffer cache may be required (data density decreases).
+  - B-trees can get an extra level => slower index access.
+  - Files take up extra space on disk and in backups.
+- If data density is too low, =VACUUM FULL= rebuilds the table and index from scratch, packing the data as densely as possible.
+- In =VACUUM FULL=:
+  - Postgres rebuilds the table and then each of its indexes.
+  - Both old and new files for each object have to be stored on disk.
+  - The access to the table is fully blocked for reads and writes.
+
+**** Estimating Data Density
+
+- Exact density, too expensive for large objects:
+  - For tables:  =pgstattuple('tablename')=, column =tuple_percent=.
+  - For indexes: =pgstatindex('indexname')=, column =avg_leaf_density=.
+- Less accurate: estimate =data volume / file size=. See [[https://wiki.postgresql.org/wiki/Show_database_bloat][these huge queries]].
+- For simply getting the sizes of the table and all its indexes:
+  - For tables:  =pg_size_pretty(pg_table_size('tablename'))=.
+  - For indexes: =pg_size_pretty(pg_indexes_size('tablename'))=.
+- For tracking progress of =VACUUM FULL= processes: =SELECT * FROM pg_stat_progress_cluster=.
+- After a =VACUUM FULL=, it may happen that the data density of indexes is bigger than after only inserting data.
+#+begin_quote
+it is more efficient to create a B-tree from scratch based on the available data than to insert entries row by row into an already existing index
+#+end_quote
+
+
+**** Freezing
+
+- When rebuilding the table, Postgres freezes its tuples, since its cost is negligible compared to all the other work.
+- But pages are not registered in the visibility map nor in the freeze map, and headers do not receive the visibility attribute
+- This only happens after vacuuming (manual or auto)
+#+begin_quote
+It essentially means that even if all tuples in a page are beyond the database horizon, such a page will still have to be rewritten.
+#+end_quote
+
+
+*** Other Rebuilding Methods
+
+**** Alternatives to Full Vacuuming
+
+- =CLUSTER=
+  - The same as =VACUUM FULL=, but it also reorders tuples in files based on one of the available indexes (further updates will break this physical order)
+  - =VACUUM FULL= is literally a special instance of =CLUSTER= without reordering.
+- =REINDEX=
+  - Rebuilds one or more indexes.
+  - =CLUSTER= and =VACUUM FULL= use this command under the hood.
+- =TRUNCATE=
+  - Deletes all table rows, so logically equivalent to =DELETE= without a =WHERE= clause. But:
+    - =DELETE= marks tuples as deleted (they have to be vacuumed afterwards).
+    - =TRUNCATE= creates a new empty file (usually faster).
+
+**** Reducing Downtime during Rebuilding
+
+- =VACUUM FULL= takes an exclusive lock for the whole operation: not suitable for high available systems. There are some alternatives:
+  - =pg_repack= creates a new repacked table and replace the old with the new in the system catalog.
+  - =pgcompacttable= performs multiple fake row updates without changing data, so current row versions move towards the start of the file.
+    - Between updates, regular vaccuuming removes outdated tuples and truncates little by little.
+    - This takes much more time and resources, but it requires no extra space.
+
+*** Preventive Measures
+
+**** Read-Only Queries
+
+- File bloating can happen when long-running transactions hold the database horizon alongside intensive data updates.
+- A solution is to split queries into two servers:
+  - Fast OLTP queries are kept in the main server.
+  - Slow OLAP transactions are redirected to a replica.
+- If those long transactions are caused by something else (app bugs, driver bugs...), the server can be tuned with:
+  - =old_snapshot_threshold=: maximum lifetime of a snapshot after which the server removes outdated tuples. If a transaction still requires them, it errors out (snapshot too old).
+  - =idle_in_transaction_session_timeout=: lifetime of an idle transaction, after which it's aborted.
+
+**** Data Updates
+
+- Another reason of bloating: simultaneous modification of a large number of tuples.
+- A simple solution: reduce number of changes performed by a single transaction. Something like:
+#+begin_src sql
+WITH batch AS (
+    SELECT ID
+    FROM tablename
+    WHERE filtering the already processed rows
+    LIMIT batch size
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE tablename SET update clause
+WHERE id IN (SELECT id FROM batch);
+#+end_src
+- The =batch= definition selects and immediately locks a set of rows that does not exceed the specified size. The rows that are already locked by other transactions are skipped: they will get into another batch next time.
+- See example in pages 158-160.
