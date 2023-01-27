@@ -956,7 +956,6 @@ it is more efficient to create a B-tree from scratch based on the available data
 It essentially means that even if all tuples in a page are beyond the database horizon, such a page will still have to be rewritten.
 #+end_quote
 
-
 *** Other Rebuilding Methods
 
 **** Alternatives to Full Vacuuming
@@ -1009,3 +1008,143 @@ WHERE id IN (SELECT id FROM batch);
 #+end_src
 - The =batch= definition selects and immediately locks a set of rows that does not exceed the specified size. The rows that are already locked by other transactions are skipped: they will get into another batch next time.
 - See example in pages 158-160.
+
+** Chapter 9: Buffer Cache
+
+*** Caching
+
+- Fast memory is small, slow memory is big, caching is your friend.
+- Postgres buffer cache holds relation pages: it avoids access to disk (ms) by having the data in RAM (ns).
+- Postgres reads and writes all data via buffered file operations (other DBs query data on disk directly, bypassing the OS cache to avoid double-caching).
+- There's a project to use direct I/O through direct memory access (DMA), but it's a huge undertaking.
+
+*** Buffer Cache Design
+
+- Buffer cache is in the server's shared memory and accessible to all processes.
+- It is an array of buffers
+  - Each buffer reserves a memory chunk (typo in p. 170: chuck) for one data page and its header.
+  - The page header in the buffer contains:
+    - Physical location of the page (file ID, fork, block number)
+    - Attribute showing whether the page has been modified (what is called a =dirty= page).
+    - Buffer usage count.
+    - Pin count (or reference count).
+- To read a page:
+  1. Processes request a page from the buffer manager.
+  2. The manager returns the ID of the buffer containing the page.
+  3. The process reads the data and modifies it in place (no file operations occur).
+- While the page is in use, its buffer is pinned, which avoids eviction of the page. Each pin increments the usage count as well.
+- The extension =pg_buffercache= helps inspect the buffer directly. See examples in p. 171-172.
+
+*** Cache Hits
+
+- The buffer manager checks a hash table to see if the requested page is buffered.
+  - The cache buffer uses an extendible table that resolves collisions by chaining.
+  - Hash keys consists of:
+    - ID of the relation file
+    - Type of the fork
+    - ID of the page within the fork
+  - I didn't understand this:
+#+begin_quote
+The buffer cache implementation has long been criticized for relying on a hash table: this structure is of no use when it comes to finding all the buffers taken by pages of a particular relation, which is required to remove pages from cache when running DROP and TRUNCATE commands or truncating a table during vacuuming. Yet no one has suggested an adequate alternative so far.
+#+end_quote
+- If the page is in the cache, the manager *pins* the buffer and returns its ID.
+  - Pinning a buffer means incrementing the pin counter in its header.
+  - When the counter > 0, the buffer is assumed to be used, and no radical changes (like replacing the whole page) are allowed.
+- Using the =buffers= options in =EXPLAIN (analyze, buffers, ...)=, the query is executed and the plan shows the number of used buffers: the =hit= number. (Related [[https://postgres.fm/episodes/buffers-by-default][podcast]] and [[https://postgres.ai/blog/20220106-explain-analyze-needs-buffers-to-improve-the-postgres-query-optimization-process][blog post]]).
+- The pin count is decreased when the buffer is no longer used, but the usage count is kept. See example in p. 174-175.
+
+*** Cache Misses
+
+- When the page is not in the buffer, =EXPLAIN= with =buffers= shows a =read= number instead of =hit=. This is a cache miss.
+- =pg_statio_all_tables= show info on the cache hits and misses by table: =SELECT heap_blks_read, heap_blks_hit FROM pg_statio_all_tables WHERE relname = 'your-table-name';=.
+
+**** Buffer Search and Eviction
+
+- When the manager reads a page from disk (from the OS, actually), there are two possible scenarios:
+  1. The list of empty buffers is non-empty. The manager then chooses the first one in this list.
+  2. The list of empty buffers is empty. The manager then needs to evict one buffer using the *clock sweep algorithm*:
+     - Starting with one of the buffers, a "clock hand" goes around the buffer cache and reduces the usage count of each buffer by one as it passes.
+     - The first unpinned buffer with usage count of 0 is evicted and used for the new page.
+- Summary of pin and usage counts:
+  - Each time the buffer is accessed, its pin count is incremented. As soon as it is no longer in use, its pin count is decremented.
+  - Each time the buffer is accessed, its usage count is incremented.
+  - Each time the clock hand swipes the buffer, its usage count is decremented.
+- The max value for usage count is 5.
+- When the buffer to evict is found:
+  - If the buffer is dirty, the manager writes it to disk first.
+  - The reference to the old page is removed from the hash table.
+  - The new page is read into the buffer using buffered I/O (a disk access will happen only if the OS doesn't have it in its cache).
+  - The hash table is updated to refer to the new page.
+  - The buffer pin and usage counts are set to 1.
+
+*** Bulk Eviction
+
+- Bulk reads or writes can evict useful pages for one-time data.
+- To prevent this, they use small *buffer rings*.
+  - A buffer ring is an array of buffers used one after another.
+  - First, the ring is empty.
+  - Then, individual buffers join the ring in the usual manner.
+  - When a buffer has to be evicted, it only happens within the ring limits.
+  - Buffers that are in a ring are not excluded from the gneral buffer cache.
+- Three eviction strategies:
+  - Bulk reads strategy:
+    - Used for sequential scans of large tables when their size exceeds 1/4 of the buffer cache.
+    - Ring buffer takes 256kB (32 pages)
+    - No writes to disk happen; if a buffer to evict is dirty, it is simply swapped by another one.
+    - If the table is scanned by another process, the new one joins the existing buffer ring.
+  - Bulk writes strategy:
+    - Used for =COPY FROM=, =CREATE TABLE AS SELECT=, =CREATE MATERIALIZED VIEW= and =ALTER TABLE= commands that cause table rewrites.
+    - Ring buffer takes 16MB (2048 pages), or 1/8 of the buffer cache if that's smaller.
+  - Vacuuming strategy:
+    - Used by vacuuming when a full table scan without visibility map is needed.
+    - Ring buffer takes 256kB (32 pages)
+- Scenarios where buffer rings do not prevent undersired eviction:
+  - In =UPDATE= or =DELETE= commands, the bulk reads strategy is used, but pages are constantly modified, so the ring is useless.
+  - Storing oversized data in TOAST tables: toasted values are always accessed via an index, so they bypass rings.
+- See example from p. 180-182.
+
+*** Choosing the Buffer Cache Size
+
+- Size of the buffer cache is configured via the =shared_buffers= parameter. It defaults to 128MB, which is known to be low ❗
+- Updating it needs a server restart.
+- Rule: The cache should have space for the set of hot data that is usually used simultaneously plus some space for one-time data.
+  - Too small: many evictions, excessive I/O operations.
+  - Too big: less RAM for other stuff, higher maintenance costs (❓).
+- A too small buffer cache may be indirectly fixed by the OS cache.
+- Typical recommendation: start with 1/4 of RAM and adjust as required.
+- How to adjust?
+  - Experimentation on a test environment.
+  - Analysis:
+    - Check buffer distribution by their usage: =SELECT usagecount, count(*) FROM pg_buffercache GROUP BY usagecount ORDER BY usagecount;=. The row with a =NULL= value in =usagecount= correspond to free buffers.
+    - Check what fraction of each relation is cached and whether this data is hot (=usagecount > 1=): see big query in p. 184.
+    - Some tips when running =pg_buffercache= queries:
+      - Repeat those queries several times.
+      - Do not run those queries non-stop, they lock the viewed buffers.
+
+*** Cache Warming
+
+- After a server restart, the cache is empty, and it needs time to warm up.
+- There is an extension to help with this: =pg_prewarm=.
+- To enable the writing of the current cache state to disk to later restore it:
+  - =ALTER SYSTEM SET shared_preload_libraries = 'pg_prewarm';=
+- By default, every 5m, the =autoprewarm leader= process flushes the list of cached pages to disk, to the =autoprewarm.blocks= file.
+- You can cache a whole table by =SELECT pg_prewarm('your-table-name')=.
+- The cache dump can be manually initiated with =SELECT autoprewarm_dump_now()=.
+- The dump is loaded automatically when the server is restarted.
+- ❓ Should we use this in the load-test for starting the test with a warm cache? Is there something similar for MySQL?
+
+*** Local Cache
+
+- Temporary tables do not follow the general cache workflow.
+- Temporary tables are visible to a single process, so the data is cached in the local cache of the process (instead of the shared memory).
+- Similar stuff:
+  - Page search is performed via a hash table
+  - Eviction follows the standard algorithm
+  - Pages can be pinned to avoid eviction
+- Different stuff:
+  - Buffer rings are not used
+  - Implementation is simpler:
+    - No locks on memory structures (only one process access the buffers)
+    - No fault tolerance (data exists until the end of the session)
+  - Local cache memory is assigned on demand. Its size can be configured with the =temp_buffers= parameter.
+  - In the output of =EXPLAIN= with =buffers=, calls to the cache are tagged as =local= instead of =shared=.
