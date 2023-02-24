@@ -418,7 +418,7 @@ All versions of all rows are marked with two values: =xmin= and =xmax=. They are
 **** Commit (CLOG and ProcArray)
 
 There are two additional structures in the server's shared memory:
-- The commit log (CLOG): it contains two bits per transaction: one for committed, one for aborted
+- The commit log (CLOG): it contains two bits per transaction: one for committed, one for aborted.
 - The ProcArray: a list of all the active processes: for each process, its current transaction is specified.
 
 These two structures are used whenever a **new** transaction reads the row version from the page, to know if it's not visible (active, not committed or aborted):
@@ -1148,3 +1148,162 @@ The buffer cache implementation has long been criticized for relying on a hash t
     - No fault tolerance (data exists until the end of the session)
   - Local cache memory is assigned on demand. Its size can be configured with the =temp_buffers= parameter.
   - In the output of =EXPLAIN= with =buffers=, calls to the cache are tagged as =local= instead of =shared=.
+
+** Chapter 10: Write-Ahead Log
+
+*** Logging
+
+- Writing data to disk at all times is not practical, as it would make the system very inefficient.
+- So if there's a failure, RAM and disk will be in inconsistent states.
+- The way to recover from this type of failures is logging in disk all changes that happen in RAM.
+  - Every change that happens in RAM creates a log entry with a description of what is going to be done.
+  - The Log entry is created Ahead of the Write.
+  - When it's needed, the system can read the log and recreate each step whose results were not written to disk.
+- Why write an entry to disk but not the results of the action?
+  - WAL entries are a continuous stream of data, which is easier to write to disk (❓why? because it's a sequential write?).
+  - WAL entries are smaller that a page.
+- WAL is also used for point-in-time recovery from backup and replication.
+
+| Operation                         | Logged | Comments                                                      |
+|-----------------------------------+--------+---------------------------------------------------------------|
+| Modifications in the buffer cache | Yes    | Writes are deferred                                           |
+| Transaction commits and rollbacks | Yes    | Status change happens in CLOG buffers                         |
+| File operations                   | Yes    | Must be in sync with data changes                             |
+| Operations on =UNLOGGED= tables   | No     |                                                               |
+| Operations on temporary tables    | No     | Lifetime limited by the session (will end if there's a crash) |
+
+*** WAL Structure
+
+**** Logical Structure
+
+- WAL is a stream of log entries of variable length.
+- Each entry contains:
+  - Header, which contains:
+    - Transaction ID
+    - Resource manager that interprets the entry.
+    - Checksum for data corruption.
+    - Entry length.
+    - Reference to the previous entry.
+  - Data about the operation itself.
+    - The data can have many formats and meanings.
+    - That's why we need to specify which manager needs to interpret it.
+- WAL files live in special buffers in the server's shared memory.
+- The size of this cache is defined by =wal_buffers= (default: 1/32 of the total buffer cache size)
+- When WAL entries make it to disk, CLOG and data pages can be evicted.
+  - If the system needs to evict some page before its entry was written to disk, this is forced.
+- WAL cache operates in *ring mode*:
+  - New entries added to the head
+  - Old entries at the tail are saved to disk
+- Log entries are referred to with the type =pg_lsn=, or Log Sequence Number:
+  - 64-bit offset in bytes from the start of the WAL to the entry.
+  - Displayed as 2 32-bit numbers in hex separated by /
+- Page headers contain the LSN of the latest WAL entry related to this page.
+  - This is used to ensure that the page is flushed to disk after the entry.
+- CLOG pages also track the latest WAL entry related to them, but this info is stored in RAM.
+- How to get info from the WAL:
+  - =pg_current_wal_lsn= is the position of the last entry saved to disk: the buffer's tail.
+  - =pg_current_wal_insert_lsn= is the insert position: the buffer's head.
+  - The =pageinspect= extension allows querying the LSN in the header of a page with =page_header(get_raw_page('table_name',page_number))=.
+  - Knowing two LSN positions, calculating the size in bytes of the entries between them can be computed as =SELECT '0/3E7442D0'::pg_lsn - '0/3E744260'::pg_lsn=.
+
+**** Physical Structure
+
+
+- WAL is stored in separate files (segments) of size =wal_segment_size= (default 16MB)
+  - Segment size can only be modified during cluster initialization.
+- A new file is simply created when the current one reaches the max size.
+- Given the LSN of an entry, we can know the file it is and the offset inside the file:
+  - =SELECT file_name, upper(to_hex(file_offset)) file_offset FROM pg_walfile_name_offset('0/3E744260');=
+- The name of the file, an hexadecimal number, looks like:
+#+begin_src
+        Highest LSN bits
+        ----------------
+00000001000000000000003E
+--------
+timeline
+#+end_src
+  - Timeline is used for recovery from a backup (❓)
+  - The lowest LSN bits are the file offset.
+- How to get info from the WAL:
+  - =SELECT * FROM pg_ls_waldir() WHERE name = 'walfilename'= shows the size and modification time of the file.
+  - The =pg_waldump= utility (under the installation directory) shows the headers of the entries. You need to specify where the WAL file is and the start and end entries of the interval you want to see. For example:
+#+begin_src sh
+pg_waldump -p /usr/local/pgsql/data/pg_wal -s 0/3E744260 -e 0/3E7442D0
+#+end_src
+
+*** Checkpoint
+
+- Having the WAL is good, but how do we decide where to start applying WAL entries in case of a failure?
+  - If too late, the pages written before this will not be updated.
+  - If too soon, we'll have to store huge amounts of data.
+  - We need a checkpoint that moves forward, making it safe to remove all previous WAL entries.
+- How to create checkpoints?
+  - Easy way: periodically, stop all operations and write everything to disk.
+  - Actual way: convert the checkpoint in an interval.
+- The checkpoint is created by the =checkpointer= process:
+  - Checkpoint start: all pages that can be written instantaneous are flushed to disk.
+  - Checkpoint execution:
+    1. All buffers that were dirty at the start receive a special tag.
+    2. All tagged buffers are written to disk (they are not evicted, though), ordered by their IDs.
+    3. All tagged buffers get the tag removed.
+  - Checkpoint completion:
+    1. A new WAL entry is created containing the checkpoint's start LSN.
+    2. The =PGDATA/global/pg_control= file gets updated to contain the LSN of both the checkpoint start and checkpoint completion.
+  - See example of the process in pages 198-199.
+
+*** Recovery
+
+- When the server starts, the =postmaster= process spawns the =startup= process, which performs recovery.
+- A failure is identified if the =pg_control= file contains a cluster state of =in production= instead of =shut down=. If that happens:
+  1. =startup= initiates recovery from the LSN of the latest completed checkpoint start.
+  2. =startup= goes through the WAL entries one by one and applies them to data pages.
+     - The entry is applied only if the page contains a smaller LSN.
+       - There is an exception: WAL entries known as full page image (FPI), which will override the whole page. These entries are idempotent and can be applied always.
+     - WAL entries are applied to all objects needed:
+       - Pages in the buffer: entries are applied as regular page updates
+       - Files: entries recreate files if they should exist and they don't.
+       - Unlogged relations: skipped, and overwritten by the initialization forks.
+  3. =startup= executes the checkpoint to start from a healthy state.
+- See example of the process in pages 201-202.
+
+*** Background Writing
+
+- We want to avoid writing when evicting a page: ideally, it is already in disk.
+- The =checkpointer= flushes pages to disk periodically, but it's not enough.
+- A =bgwriter= process takes care of this:
+  - It uses the same algorithm used for choosing which page to evict from cache, but:
+    - It uses its own clock hand, "that never lags behind that of eviction and typically overtakes it" (❓).
+    - The usage count is not reduced when the clock hand goes through a buffer.
+- As with choosing pages for eviction, =bgwriteer= flushes pages to disk that are not pinned and have zero usage count. This makes eviction more likely to choose a page that is already on disk.
+
+*** WAL Setup
+
+**** Configuring Checkpoints
+
+- =checkpoint_completion_target= specifies the percentage of time between the starts of two consecutive checkpoints that is used in writing dirty buffers (default 0.9). Recommended not to modify.
+- For configuring other params:
+  1. Decide the volume of WAL files to store between two consecutive checkpoints. More files: less overhead, less free space, longer recovery times.
+  2. Under normal load, jot down an initial insert LSN and check the difference between it and the current insert position from time to time, until the volume of WAL decide in 1. is reached. Use that value as =checkpoint_timeout= (which defaults to 5 min, likely too small).
+  3. To account for higher loads, set up the =max_wal_size= parameter. When the WAL files exceed this threshold, an extra checkpoint is created.
+  4. The actual size will be the calculated size in 1 multiplied by =1 + checkpoint_completion_target= (default 1.9), because Postgres stores the entries from the latest completed checkpoint and the current one.
+- Postgres checks the progress of the checkpoint periodically (❓ how frequent?):
+  - Actual progress is the fraction of cached pages already processed.
+  - Expected progress by time is the fraction of time already elapsed. The checkpoint should complete within =checkpoint_timeout * checkpoint_completion_target=.
+  - Expected progress by size is the fraction of the already filled WAL files. The checkpoint should fill at most =max_wal_size * checkopoint_completion_target=.
+  - If dirty pages are written to disk ahead of schedule, =checkpointer= is paused. If there is a delay, it catches up as soon as possible.
+- WAL files that are not required anymore are deleted, but some of them (up to =min_wal_size=) are reused.
+- See image in page 205 for a summary of most of the parameters.
+- WAL size may exceed =max_wal_size= during load spikes.
+  - If WAL files need to be replicated or continuously archived (❓), they cannot be deleted.
+  - =wal_keep_size= allows for reserving a certain amount of space for WAL files (❓).
+
+**** Configuring Background Writing
+
+- =bgwriter_delay= specifies the time between each execution of the =bgwriter= process.
+- The number of pages written between two pauses:
+  - Depends on the average number of buffers access by backends since the previous run (moving average).
+  - The number of pages written is the average multiplied by the param =bgwriter_lru_multiplier=.
+  - In any case, it cannot exceed =bgwriter_lru_maxpages= (100 by default).
+- If there are no dirty buffers (idle system), then =bgwriter= sleeps until there's one.
+
+**** Monitoring
